@@ -64,25 +64,52 @@ function compareAndInsertDateRange(sheetName, compareColumn, startDateStr, endDa
     return;
   }
 
-  // ── 5. 批量读取比较列数据（性能优化：一次性读入内存二维数组）────────────────
-  // 构造比较列的整列范围地址，例如 "B2:B100001"
-  var compareStart  = compareColumn + "2";                    // 数据起始单元格，如 "B2"
-  var compareEnd    = compareColumn + lastRow;                 // 数据结束单元格，如 "B100001"
-  // Range.Value 返回二维数组（行×列），一次 API 调用取回所有值，性能远优于逐行读取
-  var compareCells  = sheet.Range(compareStart + ":" + compareEnd);
-  var compareValues = compareCells.Value; // 二维数组，compareValues[i][0] 对应第 i+2 行
+  // ── 5. 批量读取比较列数据（性能优化：一次性读入内存数组）──────────────────────
+  var rowCount     = lastRow - 1;              // 数据行数（不含标题行）
+  var compareStart = compareColumn + "2";      // 数据起始单元格，如 "B2"
+  var compareEnd   = compareColumn + lastRow;  // 数据结束单元格，如 "B100001"
+  // Range.Value 一次 API 调用取回所有值；
+  // 注意：WPS JSA 遵循 VBA 惯例，多单元格时返回 1-based 二维数组
+  //（行、列下标均从 1 开始），单单元格时直接返回标量值。
+  var rawValues = sheet.Range(compareStart + ":" + compareEnd).Value;
 
-  // ── 6. 准备结果数组（与读入数组等长，初始化为 null）─────────────────────────
-  var rowCount = lastRow - 1; // 数据行数（不含标题行）
-  // 构造与 compareValues 相同维度的二维数组，用于批量写回
-  var insertValues = new Array(rowCount);
-  for (var i = 0; i < rowCount; i++) {
-    insertValues[i] = [null]; // 每行单列，默认空值（不覆盖原有内容的替代方案）
+  // ── 6. 规范化为 0-based 一维数组，屏蔽 WPS JSA 的 1-based 索引差异 ──────────
+  // compareArr[0] 对应第 2 行，compareArr[rowCount-1] 对应最后一行
+  var compareArr = new Array(rowCount);
+  if (rowCount === 1) {
+    // 单行：.Value 直接返回标量（字符串、数字或 Date），无需索引
+    compareArr[0] = rawValues;
+  } else {
+    // 多行：WPS JSA 返回 1-based 二维数组，row 从 1 开始，col 从 1 开始
+    for (var r = 0; r < rowCount; r++) {
+      var rowData = rawValues[r + 1]; // 取第 r+1 行（1-based）
+      if (rowData === null || rowData === undefined) {
+        // 空行，存入 null
+        compareArr[r] = null;
+      } else if (rowData instanceof Date || typeof rowData !== "object") {
+        // 若 rowData 本身是值（1D 退化情况），直接使用
+        compareArr[r] = rowData;
+      } else {
+        // 正常 2D 情况：取第 1 列（1-based），兼容 0-based 列索引做保底
+        compareArr[r] = rowData[1] !== undefined ? rowData[1] : rowData[0];
+      }
+    }
   }
 
-  // ── 7. 遍历比较列，逐行判断日期是否在范围内 ──────────────────────────────
+  // ── 7. 准备结果数组（0-based 二维数组，供批量写回使用）────────────────────────
+  // WPS JSA 写入 Range.Value 时接受标准 JS 0-based 数组，无需 1-based 调整
+  var insertValues = new Array(rowCount);
   for (var i = 0; i < rowCount; i++) {
-    var cellValue = compareValues[i][0]; // 取出当前行的单元格值
+    insertValues[i] = [null]; // 每行单列，默认空值
+  }
+
+  // ── 8. 遍历规范化后的数组，逐行判断日期是否在范围内 ─────────────────────────
+  // 将开始/结束时间戳提到循环外，避免重复计算
+  var startTime = startDate.getTime(); // 开始日期的毫秒时间戳
+  var endTime   = endDate.getTime();   // 结束日期的毫秒时间戳
+
+  for (var i = 0; i < rowCount; i++) {
+    var cellValue = compareArr[i]; // 取出当前行的单元格值（已规范化）
 
     // 跳过空单元格，避免无效转换
     if (cellValue === null || cellValue === undefined || cellValue === "") {
@@ -118,8 +145,6 @@ function compareAndInsertDateRange(sheetName, compareColumn, startDateStr, endDa
       cellDate.getUTCMonth(),
       cellDate.getUTCDate()
     );
-    var startTime = startDate.getTime(); // 开始日期的时间戳（毫秒）
-    var endTime   = endDate.getTime();   // 结束日期的时间戳（毫秒）
 
     // 判断当前行日期是否 >= 开始日期 且 <= 结束日期
     if (cellTime >= startTime && cellTime <= endTime) {
@@ -127,10 +152,10 @@ function compareAndInsertDateRange(sheetName, compareColumn, startDateStr, endDa
     }
   }
 
-  // ── 8. 批量写回结果（一次 API 调用写入所有行，避免逐行写入的性能损耗）──────
-  var insertStart = insertColumn + "2";          // 写入起始单元格，如 "C2"
-  var insertEnd   = insertColumn + lastRow;       // 写入结束单元格，如 "C100001"
-  // 将二维数组直接赋值给 Range.Value，一次性写入所有结果
+  // ── 9. 批量写回结果（一次 API 调用写入所有行，避免逐行写入的性能损耗）──────
+  var insertStart = insertColumn + "2";    // 写入起始单元格，如 "C2"
+  var insertEnd   = insertColumn + lastRow; // 写入结束单元格，如 "C100001"
+  // 将 0-based 二维数组直接赋值给 Range.Value，WPS JSA 会正确映射到单元格
   sheet.Range(insertStart + ":" + insertEnd).Value = insertValues;
 }
 

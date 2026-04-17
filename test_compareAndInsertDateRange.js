@@ -28,11 +28,11 @@ var mockSheet = {
   Range: function(addr) {
     var self = this;
     return {
-      // 读取时解析地址范围，返回二维数组
+      // 读取时解析地址范围，返回 WPS JSA 风格的 1-based 二维数组
       get Value() {
         return self._readRange(addr);
       },
-      // 写入时将二维数组存入 _store
+      // 写入时接收标准 0-based 二维数组
       set Value(arr) {
         self._writeRange(addr, arr);
       }
@@ -49,25 +49,38 @@ var mockSheet = {
   // 列字母转0-based索引（仅支持单字母列 A-Z）
   _colIndex: function(letter) { return letter.toUpperCase().charCodeAt(0) - 65; },
 
-  // 读取指定列范围，返回二维数组
+  // 读取指定列范围，返回 WPS JSA 风格的 1-based 二维数组（模拟真实环境）
+  // 即：result[1][1] 是第一个单元格的值，result[0] 为 undefined
   _readRange: function(addr) {
     var p = this._parseAddr(addr);
     var colIdx = this._colIndex(p.col);
-    var result = [];
+    var rowSpan = p.r2 - p.r1 + 1;
+
+    if (rowSpan === 1) {
+      // 单行时直接返回标量值（WPS JSA 行为）
+      var rowData = mockData[p.r1 - 1];
+      return rowData ? rowData[colIdx] : null;
+    }
+
+    // 多行：构造 1-based 二维数组（下标 1..rowSpan）
+    // 用稀疏方式：result[i] 表示第 i 行（i 从 1 开始），result[0] 留为 undefined
+    var result = new Array(rowSpan + 1); // 长度 rowSpan+1，index 0 空置
     for (var r = p.r1; r <= p.r2; r++) {
-      var rowData = mockData[r - 1]; // mockData 0-indexed
-      result.push([rowData ? rowData[colIdx] : null]);
+      var rowData = mockData[r - 1];
+      var val = rowData ? rowData[colIdx] : null;
+      var idx = r - p.r1 + 1;          // 1-based 行索引
+      result[idx] = {};                 // 每行也是 1-based 对象
+      result[idx][1] = val;             // 列索引从 1 开始
     }
     return result;
   },
 
-  // 写入指定列范围
+  // 写入指定列范围，接收标准 0-based 二维数组（JS 惯例）
   _writeRange: function(addr, arr) {
     var p = this._parseAddr(addr);
     var colIdx = this._colIndex(p.col);
     for (var i = 0; i < arr.length; i++) {
       var r = p.r1 + i;
-      // 扩展 mockData 行（如果不够长）
       while (mockData.length < r) mockData.push([]);
       if (!mockData[r - 1]) mockData[r - 1] = [];
       mockData[r - 1][colIdx] = arr[i][0];
@@ -85,7 +98,7 @@ var Application = {
   }
 };
 
-// ── 粘贴主函数（原样复制，不改动任何逻辑）────────────────────────────────────
+// ── 粘贴主函数（与 compareAndInsertDateRange.js 完全一致）──────────────────────
 function compareAndInsertDateRange(sheetName, compareColumn, startDateStr, endDateStr, insertColumn) {
   var sheet = Application.ActiveWorkbook.Sheets(sheetName);
 
@@ -112,19 +125,38 @@ function compareAndInsertDateRange(sheetName, compareColumn, startDateStr, endDa
   var lastRow = sheet.UsedRange.Rows.Count;
   if (lastRow < 2) return;
 
-  var compareStart  = compareColumn + "2";
-  var compareEnd    = compareColumn + lastRow;
-  var compareCells  = sheet.Range(compareStart + ":" + compareEnd);
-  var compareValues = compareCells.Value;
+  var rowCount     = lastRow - 1;
+  var compareStart = compareColumn + "2";
+  var compareEnd   = compareColumn + lastRow;
+  var rawValues    = sheet.Range(compareStart + ":" + compareEnd).Value;
 
-  var rowCount = lastRow - 1;
+  // 规范化为 0-based 一维数组（修复 WPS JSA 1-based 二维数组导致的崩溃）
+  var compareArr = new Array(rowCount);
+  if (rowCount === 1) {
+    compareArr[0] = rawValues;
+  } else {
+    for (var r = 0; r < rowCount; r++) {
+      var rowData = rawValues[r + 1];
+      if (rowData === null || rowData === undefined) {
+        compareArr[r] = null;
+      } else if (rowData instanceof Date || typeof rowData !== "object") {
+        compareArr[r] = rowData;
+      } else {
+        compareArr[r] = rowData[1] !== undefined ? rowData[1] : rowData[0];
+      }
+    }
+  }
+
   var insertValues = new Array(rowCount);
   for (var i = 0; i < rowCount; i++) {
     insertValues[i] = [null];
   }
 
+  var startTime = startDate.getTime();
+  var endTime   = endDate.getTime();
+
   for (var i = 0; i < rowCount; i++) {
-    var cellValue = compareValues[i][0];
+    var cellValue = compareArr[i];
     if (cellValue === null || cellValue === undefined || cellValue === "") continue;
 
     var cellDate;
@@ -138,9 +170,7 @@ function compareAndInsertDateRange(sheetName, compareColumn, startDateStr, endDa
       continue;
     }
 
-    var cellTime  = Date.UTC(cellDate.getUTCFullYear(), cellDate.getUTCMonth(), cellDate.getUTCDate());
-    var startTime = startDate.getTime();
-    var endTime   = endDate.getTime();
+    var cellTime = Date.UTC(cellDate.getUTCFullYear(), cellDate.getUTCMonth(), cellDate.getUTCDate());
 
     if (cellTime >= startTime && cellTime <= endTime) {
       insertValues[i][0] = dateRangeLabel;
